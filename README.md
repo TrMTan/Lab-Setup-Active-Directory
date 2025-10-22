@@ -15,5 +15,6 @@ Supported Attacks
 - Golden Ticket
 - ESC1
 - Shadow Credentials
+- Resource Based Constrained Delegation
 
 I will update another attacks soon 🥑

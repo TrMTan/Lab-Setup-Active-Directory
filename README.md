@@ -16,6 +16,7 @@ Supported Attacks
 - ESC1
 - Shadow Credentials
 - Resource Based Constrained Delegation
+- Pass-the-Hash
 - Abusing AD-DACL: ForceChangePassword
 - Abusing AD-DACL: WriteOwner (User/Group)
 - Anonymous LDAP

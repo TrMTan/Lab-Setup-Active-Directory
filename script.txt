@@ -1,0 +1,629 @@
+Import-Module ActiveDirectory -ErrorAction Stop
+
+function Show-Menu {
+    Write-Host ""
+    Write-Host "Select an option:"
+    Write-Host "1) Kerberoasting (add SPN + RC4)"
+    Write-Host "2) ASREPRoasting (disable Kerberos pre-auth)"
+    Write-Host "3) Shadow Credentials (add user to Key Admins & Enterprise Key Admins)"
+    Write-Host "4) DCSync (grant replication rights)"
+    Write-Host "5) ESC1 (create ESC1 via ADCSTemplate or fallback)"
+    Write-Host "6) Resource Based Constrained Delegation"
+    Write-Host "7) Abusing AD-DACL: ForceChangePassword"
+    Write-Host "8) Abusing AD-DACL: WriteOwner (User/Group)"
+    Write-Host "9) Anonymous LDAP"
+    Write-Host "10) Restore to default"
+    Write-Host "0) Exit"
+    return (Read-Host "Enter choice")
+}
+
+function Show-RestoreMenu {
+    Write-Host ""
+    Write-Host "Select a vulnerability to restore:"
+    Write-Host "1) Kerberoasting"
+    Write-Host "2) ASREPRoasting"
+    Write-Host "3) Shadow Credentials"
+    Write-Host "4) DCSync"
+    Write-Host "5) ESC1"
+    Write-Host "6) Resource Based Constrained Delegation"
+    Write-Host "7) Abusing AD-DACL: ForceChangePassword"
+    Write-Host "8) Abusing AD-DACL: WriteOwner (User/Group)"
+    Write-Host "9) Anonymous LDAP"
+    Write-Host "0) Back to main menu"
+    return (Read-Host "Enter choice")
+}
+
+# Helper: check if local server has AD CS role and a CA configured
+function Check-ADCS-And-CA {
+    $result = [PSCustomObject]@{
+        ADCSRoleInstalled = $false
+        CertSvcService    = $null
+        CAConfigured      = $false
+    }
+
+    try {
+        $feature = Get-WindowsFeature -Name "ADCS-Cert-Authority" -ErrorAction Stop
+        if ($feature.Installed) { $result.ADCSRoleInstalled = $true }
+    } catch {
+        # Ignore errors if Get-WindowsFeature is unavailable
+    }
+
+    $svc = Get-Service -Name "CertSvc" -ErrorAction SilentlyContinue
+    if ($svc) {
+        $result.CertSvcService = $svc.Status
+    }
+
+    try {
+        if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration") {
+            $result.CAConfigured = $true
+        }
+    } catch {
+        # Ignore registry access errors
+    }
+
+    return $result
+}
+
+function Ensure-ADCSTemplateModule {
+    param([switch]$InstallIfMissing = $true)
+    try {
+        $mod = Get-Module -ListAvailable -Name ADCSTemplate -ErrorAction SilentlyContinue
+        if (-not $mod) {
+            if (-not $InstallIfMissing) { return $false }
+            Write-Host "ADCSTemplate module not found. Installing from PSGallery..."
+            Install-Module -Name ADCSTemplate -Force -Scope CurrentUser -ErrorAction Stop
+        }
+        Import-Module ADCSTemplate -ErrorAction Stop
+        Write-Host "ADCSTemplate loaded." -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host ("Error loading ADCSTemplate: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+        return $false
+    }
+}
+
+# Get domain info
+$domain = Get-ADDomain
+$domainDN = $domain.DistinguishedName
+$domainName = $domain.NetBIOSName
+
+# Main menu loop
+do {
+    $choice = Show-Menu
+    $user = $null
+
+    # Prompt for username only for options 1, 2, 3, or 4
+    if ($choice -in @('1', '2', '3', '4', '6')) {
+        $username = Read-Host "Enter username (e.g., hr.user01) for attack type $choice"
+        try {
+            $user = Get-ADUser -Identity $username -Properties * -ErrorAction Stop
+            Write-Host "User found: $($user.DistinguishedName)"
+        } catch {
+            Write-Host "Error: User not found. Please try again."
+            continue
+        }
+    }
+
+    switch ($choice) {
+        '1' {
+            # Kerberoasting: Add SPN and force RC4 encryption
+            $spn = "HTTP/$($user.SamAccountName).$($domain.DNSRoot)"
+            Set-ADUser -Identity $user -ServicePrincipalNames @{Add=$spn}
+            Set-ADUser -Identity $user -Add @{"msDS-SupportedEncryptionTypes"=0x4}  # RC4 only
+            Write-Host "Kerberoasting vulnerability set up. SPN added: $spn"
+        }
+        '2' {
+            # ASREPRoasting: Disable pre-auth
+            Set-ADAccountControl -Identity $user -DoesNotRequirePreAuth $true
+            Write-Host "ASREPRoasting vulnerability set up."
+        }
+        '3' {
+            # Shadow Credentials: Add user to Key Admins and Enterprise Key Admins groups
+            Write-Host "Checking AD Certificate Services (ADCS) and Certificate Authority (CA) status on this host..."
+            $adcsCheck = Check-ADCS-And-CA
+
+            if ($adcsCheck.ADCSRoleInstalled) {
+                Write-Host " - ADCS role appears installed on this server (Get-WindowsFeature detected ADCS-Cert-Authority)."
+            } else {
+                Write-Host " - ADCS role NOT detected by Get-WindowsFeature (may still be installed if Get-WindowsFeature unavailable)."
+            }
+
+            if ($adcsCheck.CertSvcService) {
+                Write-Host " - CertSvc service found. Status: $($adcsCheck.CertSvcService)."
+            } else {
+                Write-Host " - CertSvc service NOT found on this host."
+            }
+
+            if ($adcsCheck.CAConfigured) {
+                Write-Host " - Registry indicates a configured CA on this host (HKLM:\\...\\CertSvc\\Configuration present)."
+            } else {
+                Write-Host " - No local CA configuration detected in registry."
+            }
+
+            if (-not ($adcsCheck.CertSvcService -or $adcsCheck.ADCSRoleInstalled -or $adcsCheck.CAConfigured)) {
+                Write-Host "WARNING: No signs of ADCS/CA on this host. Adding user to Key Admins / Enterprise Key Admins may be unnecessary on this host but will still modify group memberships in AD."
+                $proceed = Read-Host "Proceed to add user to groups anyway? (Y/N)"
+                if ($proceed -notin @('Y','y')) {
+                    Write-Host "Operation cancelled by operator."
+                    break
+                }
+            }
+
+            try {
+                $groupsToAdd = @("Key Admins","Enterprise Key Admins")
+                foreach ($g in $groupsToAdd) {
+                    $group = Get-ADGroup -Identity $g -ErrorAction SilentlyContinue
+                    if ($group) {
+                        Add-ADGroupMember -Identity $g -Members $user -ErrorAction Stop
+                        Write-Host "User added to group: $g"
+                    } else {
+                        Write-Host "Group not found: $g. Skipping."
+                    }
+                }
+                Write-Host "Shadow Credentials steps completed (group modifications done where groups exist)."
+            } catch {
+                Write-Host "Error: Failed to add user to Key Admins or Enterprise Key Admins. $_"
+            }
+        }
+        '4' {
+            # DCSync: Grant replication rights to the user
+            dsacls $domainDN /G "$($user.SamAccountName):CA;Replicating Directory Changes;" > $null 2>&1
+            dsacls $domainDN /G "$($user.SamAccountName):CA;Replicating Directory Changes All;" > $null 2>&1
+            Write-Host "DCSync rights granted to the user."
+        }
+        '5' {
+            Write-Host "Create ESC1: attempting ADCSTemplate workflow..."
+            $okModule = Ensure-ADCSTemplateModule -InstallIfMissing
+
+            $sourceDisplayName = Read-Host "Source template display name (default: Code Signing)"
+            if ([string]::IsNullOrWhiteSpace($sourceDisplayName)) { $sourceDisplayName = "Code Signing" }
+
+            $templateName = Read-Host "New template display name (default: ESC1)"
+            if ([string]::IsNullOrWhiteSpace($templateName)) { $templateName = "ESC1" }
+
+            $root = Get-ADRootDSE
+            $configNC = $root.ConfigurationNamingContext
+            $templateDN = "CN=$templateName,CN=Certificate Templates,CN=Public Key Services,CN=Services,$configNC"
+            $oidClientAuth = "1.3.6.1.5.5.7.3.2"
+
+            if ($okModule) {
+                try {
+                    Write-Host "Exporting source template to JSON..."
+                    $jsonString = Export-ADCSTemplate -DisplayName $sourceDisplayName -ErrorAction Stop
+                    if (-not $jsonString) { throw "Export-ADCSTemplate returned no data." }
+                    Write-Host "Creating new template via New-ADCSTemplate..."
+                    $identityArg = "$($domain.NetBIOSName)\Domain Users"
+                    New-ADCSTemplate -DisplayName $templateName -JSON $jsonString -Publish -Identity $identityArg -ErrorAction Stop
+                    Write-Host ("Created and published template '{0}' and granted Read/Enroll to '{1}'" -f $templateName, $identityArg) -ForegroundColor Green
+
+                    Set-ADObject -Identity $templateDN -ProtectedFromAccidentalDeletion $false -ErrorAction SilentlyContinue
+                    Write-Host "Disabled ProtectedFromAccidentalDeletion for $templateName." -ForegroundColor Cyan
+
+                    Set-ADObject -Identity $templateDN -Replace @{
+                        "msPKI-Certificate-Name-Flag"=1
+                        "msPKI-Private-Key-Flag"=16842752
+                        "msPKI-Template-Minor-Revision"=3
+                        "msPKI-Template-Schema-Version"=2
+                        "msPKI-Certificate-Application-Policy"=@("1.3.6.1.5.5.7.3.2")
+                        "pKIExtendedKeyUsage"=@("1.3.6.1.5.5.7.3.2")
+                        "pKICriticalExtensions"=@("2.5.29.7","2.5.29.15")
+                        "pKIDefaultCSPs"=@("2,Microsoft Base Cryptographic Provider v1.0","1,Microsoft Enhanced Cryptographic Provider v1.0")
+                        "msPKI-Minimal-Key-Size"=2048
+                    }
+                    Write-Host "Modified template for ESC1 vulnerabilities." -ForegroundColor Green
+
+                    Write-Host "ESC1 creation via ADCSTemplate complete. Verify in certtmpl.msc and certsrv.msc."
+                    continue
+                } catch {
+                    Write-Host ("ADCSTemplate workflow failed: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+                    Write-Host "Falling back to ADSI clone method..."
+                }
+            } else {
+                Write-Host "ADCSTemplate unavailable; using ADSI fallback."
+            }
+        }
+        '6' {
+            try {
+                $inputName = Read-Host "Enter target computer name (default: DC01)"
+                if ([string]::IsNullOrWhiteSpace($inputName)) { $targetComputerName = "DC01" } else { $targetComputerName = $inputName.Trim() }
+
+                # Ensure the AD computer exists
+                $computer = Get-ADComputer -Identity $targetComputerName -ErrorAction Stop
+                $computerDN = $computer.DistinguishedName
+                $adPath = "AD:\$computerDN"
+
+                # Ensure user object is available in $user (set earlier when choice in @('1','2','3','4','6'))
+                if (-not $user) {
+                    Write-Host "User variable not set. Please re-enter username." -ForegroundColor Yellow
+                    break
+                }
+
+                # Confirm user exists (if $user already pulled earlier this will pass)
+                $targetUser = Get-ADUser -Identity $user.SamAccountName -ErrorAction Stop
+
+                # Build identity in DOMAIN\samaccount format
+                $identity = New-Object System.Security.Principal.NTAccount("$domainName\$($targetUser.SamAccountName)")
+
+                # Get current ACL on the computer object
+                $acl = Get-Acl -Path $adPath
+
+                # Create Active Directory access rule for GenericAll (Full Control)
+                $rights = [System.DirectoryServices.ActiveDirectoryRights]::GenericAll
+                $ace = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                    $identity,
+                    $rights,
+                    [System.Security.AccessControl.AccessControlType]::Allow
+                )
+                # Add rule and apply
+                $acl.AddAccessRule($ace)
+                Set-Acl -Path $adPath -AclObject $acl
+                Write-Host "Success: Granted Full Control (GenericAll) on computer object $targetComputerName to $($targetUser.SamAccountName)." -ForegroundColor Green
+            } catch {
+                Write-Host "Error granting Full Control on {$targetComputerName}: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+        '7' {
+            $userA = $null; $userB = $null
+            $usernameA = Read-Host "Enter target username (User A - whose password will be reset)"
+            try {
+                $userA = Get-ADUser -Identity $usernameA -ErrorAction Stop
+                Write-Host "User A: $($userA.DistinguishedName)" -ForegroundColor Cyan
+            } catch { Write-Host "User A not found." -ForegroundColor Red; continue }
+
+            $usernameB = Read-Host "Enter delegate username (User B - who can reset password)"
+            try {
+                $userB = Get-ADUser -Identity $usernameB -ErrorAction Stop
+                Write-Host "User B: $($userB.DistinguishedName)" -ForegroundColor Cyan
+            } catch { Write-Host "User B not found." -ForegroundColor Red; continue }
+
+            $dn = $userA.DistinguishedName
+            $identity = "$domainName\$($userB.SamAccountName)"
+
+            try {
+                & dsacls "`"$dn`"" /G "`"$identity`:CA;Reset Password`"" 2>$null | Out-Null
+
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "SUCCESS: '$($userB.SamAccountName)' can now reset password of '$($userA.SamAccountName)'." -ForegroundColor Green
+                } else {
+                    throw "dsacls failed with exit code $LASTEXITCODE"
+                }
+            } catch {
+                Write-Host "FAILED: $_" -ForegroundColor Red
+            }
+        }
+        '8' {
+            $choice = Read-Host "Choose target type:`n  1) User to Group`n  2) User to User`nEnter 1 or 2"
+
+            if ($choice -eq '1') {
+                # User to Group
+                $userName = Read-Host "Enter username (granted WriteOwner)"
+                $groupName = Read-Host "Enter group name (target object, e.g. Domain Admins)"
+
+                try {
+                    $user = Get-ADUser $userName -ErrorAction Stop
+                    $group = Get-ADGroup $groupName -ErrorAction Stop
+                    $targetDN = $group.DistinguishedName
+                    $identity = "$domainName\$userName"
+                    Write-Host "Granting WriteOwner: $userName to $groupName" -ForegroundColor Cyan
+                } catch { Write-Host "User or Group not found!" -ForegroundColor Red; continue }
+            }
+            elseif ($choice -eq '2') {
+                # User to User
+                $delegate = Read-Host "Enter delegate username (granted WriteOwner)"
+                $targetUser = Read-Host "Enter target username (victim)"
+                try {
+                    $delUser = Get-ADUser $delegate -ErrorAction Stop
+                    $tgtUser = Get-ADUser $targetUser -ErrorAction Stop
+                    $targetDN = $tgtUser.DistinguishedName
+                    $identity = "$domainName\$delegate"
+                    Write-Host "Granting WriteOwner: $delegate to $targetUser" -ForegroundColor Cyan
+                } catch { Write-Host "User not found!" -ForegroundColor Red; continue }
+            }
+            else {
+                Write-Host "Invalid choice." -ForegroundColor Red
+                continue
+            }
+
+            try {
+                & dsacls "`"$targetDN`"" /G "`"$identity`:WO`"" 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "SUCCESS: '$identity' now has WriteOwner on '$targetDN'" -ForegroundColor Green
+                } else {
+                    throw "dsacls failed with exit code $LASTEXITCODE"
+                }
+            } catch {
+                Write-Host "FAILED: $_" -ForegroundColor Red
+            }
+        }
+        '9' {
+            try {
+                # Step 1: Set dSHeuristics to 0000002
+                $configPath = "LDAP://CN=Directory Service,CN=Windows NT,CN=Services,CN=Configuration,$domainDN"
+                $dirSvc = [ADSI]$configPath
+                $dirSvc.Put("dSHeuristics", "0000002")
+                $dirSvc.SetInfo()
+                Write-Host "dSHeuristics set to 0000002." -ForegroundColor Green
+
+                # Step 2: Grant GenericRead to ANONYMOUS LOGON on CN=Users
+                $usersPath = "LDAP://CN=Users,$domainDN"
+                $usersObj = [ADSI]$usersPath
+                $anon = New-Object System.Security.Principal.NTAccount("ANONYMOUS LOGON")
+                $sid = $anon.Translate([System.Security.Principal.SecurityIdentifier])
+                $rights = [System.DirectoryServices.ActiveDirectoryRights]::GenericRead
+                $type = [System.Security.AccessControl.AccessControlType]::Allow
+                $inheritance = [System.DirectoryServices.ActiveDirectorySecurityInheritance]::All
+                $ace = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($sid, $rights, $type, $inheritance)
+
+                $acl = $usersObj.PSBase.ObjectSecurity
+                $acl.ModifyAccessRule([System.Security.AccessControl.AccessControlModification]::Add, $ace, [ref]$false) | Out-Null
+                $usersObj.PSBase.ObjectSecurity = $acl
+                $usersObj.PSBase.CommitChanges()
+
+                Write-Host "Anonymous LDAP enabled: ANONYMOUS LOGON granted GenericRead on Users container." -ForegroundColor Green
+            }
+            catch {
+                Write-Host "Failed to enable Anonymous LDAP: $_" -ForegroundColor Red
+            }
+        }
+        '10' {
+            # Restore submenu
+            do {
+                $restoreChoice = Show-RestoreMenu
+                $user = $null
+
+                # Prompt for username only for options 1, 2, 3, or 4 in restore menu
+                if ($restoreChoice -in @('1', '2', '3', '4')) {
+                    $username = Read-Host "Enter username (e.g., hr.user01) to restore settings for"
+                    try {
+                        $user = Get-ADUser -Identity $username -Properties * -ErrorAction Stop
+                        Write-Host "User found: $($user.DistinguishedName)"
+                    } catch {
+                        Write-Host "Error: User not found. Please try again."
+                        continue
+                    }
+                }
+
+                switch ($restoreChoice) {
+                    '1' {
+                        # Kerberoasting:4830 Remove SPNs and reset encryption types
+                        try {
+                            Set-ADUser -Identity $user -ServicePrincipalNames $null -Clear "msDS-SupportedEncryptionTypes"
+                            Write-Host "Kerberoasting removed successfully"
+                        } catch {
+                            Write-Host "Kerberoasting remove errors: $_"
+                        }
+                    }
+                    '2' {
+                        # ASREPRoasting: Enable pre-auth
+                        try {
+                            Set-ADAccountControl -Identity $user -DoesNotRequirePreAuth $false
+                            Write-Host "ASREPRoasting removed successfully"
+                        } catch {
+                            Write-Host "ASREPRoasting remove errors: $_"
+                        }
+                    }
+                    '3' {
+                        # Shadow Credentials: Remove user from Key Admins and Enterprise Key Admins groups
+                        try {
+                            Remove-ADGroupMember -Identity "Key Admins" -Members $user -Confirm:$false -ErrorAction SilentlyContinue
+                            Remove-ADGroupMember -Identity "Enterprise Key Admins" -Members $user -Confirm:$false -ErrorAction SilentlyContinue
+                            Write-Host "Shadow Credentials restored: User removed from Key Admins and Enterprise Key Admins groups (if present)."
+                        } catch {
+                            Write-Host "Shadow Credentials restore skipped or partially failed: $_"
+                        }
+                    }
+                    '4' {
+                        # DCSync: Remove specific rights
+                        try {
+                            dsacls $domainDN /R "$($user.SamAccountName)" > $null 2>&1
+                            Write-Host "DCSync removed successfully"
+                        } catch {
+                            Write-Host "DCSync remove errors: $_"
+                        }
+                    }
+                    '5' {
+                        # Remove ESC1 template
+                        Write-Host "Remove ESC1: attempting ADCSTemplate removal..."
+                        $okModule = Ensure-ADCSTemplateModule -InstallIfMissing:$false
+                        $templateName = Read-Host "Template display name to remove (default ESC1)"
+                        if ([string]::IsNullOrWhiteSpace($templateName)) { $templateName = "ESC1" }
+
+                        if ($okModule) {
+                            try {
+                                if (Get-Command -Name Remove-ADCSTemplate -ErrorAction SilentlyContinue) {
+                                    Remove-ADCSTemplate -DisplayName $templateName -Confirm:$false -ErrorAction Stop
+                                    Write-Host ("Removed template '{0}' via ADCSTemplate module." -f $templateName) -ForegroundColor Green
+                                } else {
+                                    throw "Remove-ADCSTemplate command not present in module."
+                                }
+                            } catch {
+                                Write-Host ("ADCSTemplate removal failed: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+                                Write-Host "Falling back to ADSI removal..."
+                            }
+                        } else {
+                            Write-Host "ADCSTemplate not available; using ADSI fallback."
+                        }
+                    }
+                    '6' {
+                        try {
+                            $inputName = Read-Host "Enter target computer name to restore (default: DC01)"
+                            if ([string]::IsNullOrWhiteSpace($inputName)) { $targetComputerName = "DC01" } else { $targetComputerName = $inputName.Trim() }
+
+                            # Verify computer exists in AD
+                            $computer = Get-ADComputer -Identity $targetComputerName -ErrorAction Stop
+                            $computerDN = $computer.DistinguishedName
+                            $adPath = "AD:\$computerDN"
+
+                            # Prompt for the user to remove from Security (samAccountName)
+                            $username = Read-Host "Enter username to remove from Security:"
+                            $targetUser = Get-ADUser -Identity $username -ErrorAction Stop
+
+                            # Build NTAccount identity (DOMAIN\samAccountName)
+                            $identity = New-Object System.Security.Principal.NTAccount("$domainName\$($targetUser.SamAccountName)")
+
+                            # Get existing ACL (ActiveDirectorySecurity)
+                            $acl = Get-Acl -Path $adPath
+
+                            # Get all rules (explicit + inherited) as ActiveDirectoryAccessRule objects
+                            $allRules = $acl.GetAccessRules($true, $true, [System.Security.Principal.NTAccount])
+
+                            # Create a new ActiveDirectorySecurity and copy back only rules NOT belonging to the target identity
+                            $newAcl = New-Object System.DirectoryServices.ActiveDirectorySecurity
+
+                            foreach ($r in $allRules) {
+                                if ($r.IdentityReference -ne $identity) {
+                                    # Add the rule back to the new ACL
+                                    $newAcl.AddAccessRule($r) | Out-Null
+                                }
+                            }
+
+                            # Immediately break inheritance on new ACL (do not keep inherited ACEs) as requested
+                            $newAcl.SetAccessRuleProtection($true, $false)
+
+                            # Apply the new ACL to the AD object
+                            Set-Acl -Path $adPath -AclObject $newAcl
+
+                            # Extra cleanup: try dsacls to remove any leftover explicit rights
+                            try {
+                                dsacls $computerDN /R "$($targetUser.SamAccountName)" > $null 2>&1
+                                dsacls $computerDN /R "$($domainName)\$($targetUser.SamAccountName)" > $null 2>&1
+                            } catch {
+                                # non-fatal
+                            }
+
+                            # Verify final state
+                            $aclFinal = Get-Acl -Path $adPath
+                            $remaining = $aclFinal.GetAccessRules($true, $true, [System.Security.Principal.NTAccount]) | Where-Object { $_.IdentityReference -eq $identity }
+
+                            if ($remaining.Count -eq 0) {
+                                Write-Host "Success: removed all permissions and removed user $($targetUser.SamAccountName) from the Security of $targetComputerName." -ForegroundColor Green
+                            } else {
+                                Write-Host "Warning: $($remaining.Count) ACE(s) for $($targetUser.SamAccountName) remain. Please review manually." -ForegroundColor Yellow
+                                foreach ($x in $remaining) { Write-Host $x }
+                            }
+                        } catch {
+                            Write-Host "Error removing user from Security: $($_.Exception.Message)" -ForegroundColor Red
+                        }
+                    }
+                    '7' {
+                        $userA = $null; $userB = $null
+                        $usernameA = Read-Host "Enter target username (User A)"
+                        try { $userA = Get-ADUser $usernameA -ErrorAction Stop } catch { Write-Host "User A not found."; continue }
+
+                        $usernameB = Read-Host "Enter delegate username (User B)"
+                        try { $userB = Get-ADUser $usernameB -ErrorAction Stop } catch { Write-Host "User B not found."; continue }
+
+                        $dn = $userA.DistinguishedName
+                        $identity = "$domainName\$($userB.SamAccountName)"
+
+                        & dsacls "`"$dn`"" /R "`"$identity`"" 2>$null | Out-Null
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Host "Reset password right removed." -ForegroundColor Green
+                        } else {
+                            Write-Host "No right to remove or dsacls failed." -ForegroundColor Yellow
+                        }
+                    }
+                    '8' {
+                        $choice = Read-Host "Choose target type to restore:`n  1) User to Group`n  2) User to User`nEnter 1 or 2"
+
+                        if ($choice -eq '1') {
+                            $userName = Read-Host "Enter username"
+                            $groupName = Read-Host "Enter group name"
+                            try {
+                                $user = Get-ADUser $userName -ErrorAction Stop
+                                $group = Get-ADGroup $groupName -ErrorAction Stop
+                                $targetDN = $group.DistinguishedName
+                                $identity = "$domainName\$userName"
+                            } catch { Write-Host "Invalid input." -ForegroundColor Red; continue }
+                        }
+                        elseif ($choice -eq '2') {
+                            $delegate = Read-Host "Enter delegate username"
+                            $targetUser = Read-Host "Enter target username"
+                            try {
+                                $delUser = Get-ADUser $delegate -ErrorAction Stop
+                                $tgtUser = Get-ADUser $targetUser -ErrorAction Stop
+                                $targetDN = $tgtUser.DistinguishedName
+                                $identity = "$domainName\$delegate"
+                            } catch { Write-Host "Invalid input." -ForegroundColor Red; continue }
+                        }
+                        else {
+                            Write-Host "Invalid choice." -ForegroundColor Red
+                            continue
+                        }
+
+                        & dsacls "`"$targetDN`"" /R "`"$identity`"" 2>$null | Out-Null
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Host "WriteOwner right removed: '$identity' from '$targetDN'" -ForegroundColor Green
+                        } else {
+                            Write-Host "No right to remove or dsacls failed." -ForegroundColor Yellow
+                        }
+                    }
+                    '9' {
+                        try {
+                            # Step 1: Reset dSHeuristics
+                            $configPath = "LDAP://CN=Directory Service,CN=Windows NT,CN=Services,CN=Configuration,$domainDN"
+                            $dirSvc = [ADSI]$configPath
+                            $current = $dirSvc.Get("dSHeuristics")
+                            if ($current -eq "0000002") {
+                                $dirSvc.Put("dSHeuristics", "<not set>")  # Reset to default
+                                $dirSvc.SetInfo()
+                                Write-Host "dSHeuristics reset to default." -ForegroundColor Green
+                            } else {
+                                Write-Host "dSHeuristics was not 0000002 (current: $current). No change." -ForegroundColor Yellow
+                            }
+
+                            # Step 2: Remove GenericRead ACE from ANONYMOUS LOGON
+                            $usersPath = "LDAP://CN=Users,$domainDN"
+                            $usersObj = [ADSI]$usersPath
+                            $anon = New-Object System.Security.Principal.NTAccount("ANONYMOUS LOGON")
+                            $sid = $anon.Translate([System.Security.Principal.SecurityIdentifier])
+                            $acl = $usersObj.PSBase.ObjectSecurity
+                            $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+                            $removed = $false
+                            foreach ($rule in $rules) {
+                                if ($rule.IdentityReference.Value -eq $sid.Value -and 
+                                    ($rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericRead)) {
+                                    $acl.RemoveAccessRule($rule) | Out-Null
+                                    $removed = $true
+                                }
+                            }
+                            if ($removed) {
+                                $usersObj.PSBase.ObjectSecurity = $acl
+                                $usersObj.PSBase.CommitChanges()
+                                Write-Host "GenericRead removed from ANONYMOUS LOGON." -ForegroundColor Green
+                            } else {
+                                Write-Host "No GenericRead ACE found for ANONYMOUS LOGON." -ForegroundColor Yellow
+                            }
+
+                            # Optional: Use dsacls as fallback
+                            & dsacls "CN=Users,$domainDN" /R "ANONYMOUS LOGON" > $null 2>&1
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Host "dsacls cleanup successful." -ForegroundColor Cyan
+                            }
+                        }
+                        catch {
+                            Write-Host "Failed to restore Anonymous LDAP: $_" -ForegroundColor Red
+                        }
+                    }
+                    '0' {
+                        Write-Host "Returning to main menu..."
+                        break
+                    }
+                    default {
+                        Write-Host "Invalid choice."
+                    }
+                }
+            } while ($restoreChoice -ne '0')
+        }
+        '0' {
+            Write-Host "Exiting..."
+            break
+        }
+        default {
+            Write-Host "Invalid choice."
+        }
+    }
+
+} while ($choice -ne '0')
+
+Write-Host "Done."

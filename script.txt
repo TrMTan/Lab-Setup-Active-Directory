@@ -345,7 +345,7 @@ do {
                 Write-Host "dSHeuristics set to 0000002." -ForegroundColor Green
 
                 # Step 2: Grant GenericRead to ANONYMOUS LOGON on CN=Users
-                $usersPath = "LDAP://CN=Users,$domainDN"
+                $usersPath = "LDAP://$domainDN"
                 $usersObj = [ADSI]$usersPath
                 $anon = New-Object System.Security.Principal.NTAccount("ANONYMOUS LOGON")
                 $sid = $anon.Translate([System.Security.Principal.SecurityIdentifier])
@@ -625,5 +625,6 @@ do {
     }
 
 } while ($choice -ne '0')
+
 
 Write-Host "Done."
